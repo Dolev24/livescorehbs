@@ -1,9 +1,11 @@
 import json
 import os
 import re
+import threading
 import unicodedata
 from datetime import datetime, timezone
 from html import unescape
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlencode, urljoin
 
 import aiohttp
@@ -26,6 +28,7 @@ def env_int(name, default=0):
         return default
 
 
+KEEP_ALIVE_SECONDS = max(60, env_int("KEEP_ALIVE_SECONDS", 600))
 SCORES_CHANNEL_ID = env_int("SCORES_CHANNEL_ID")
 SCORES_CHANNEL_NAME = os.getenv("SCORES_CHANNEL_NAME", "").strip().lstrip("#")
 FOLLOWED_GAMES_FILE = os.path.join(os.path.dirname(__file__), "followed_games.json")
@@ -118,6 +121,61 @@ help_public_posts = {}
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+class HealthRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path not in ("/", "/healthz"):
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        body = b"ok\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format, *_args):
+        return
+
+
+def start_health_server():
+    port = env_int("PORT")
+    if not port:
+        return
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthRequestHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"Health server listening on port {port}")
+
+
+def get_keep_alive_url():
+    explicit_url = os.getenv("KEEP_ALIVE_URL", "").strip()
+    if explicit_url:
+        return explicit_url
+
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    if render_url:
+        return f"{render_url}/healthz"
+
+    return ""
+
+
+@tasks.loop(seconds=KEEP_ALIVE_SECONDS)
+async def keep_alive_ping():
+    url = get_keep_alive_url()
+    if not url:
+        return
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                await response.read()
+    except Exception as exc:
+        print(f"[keepalive] Ping failed: {exc}")
 
 
 def get_required_bot_permissions():
@@ -759,9 +817,6 @@ def is_half_time_status(game):
 
 
 def is_second_half_status(game):
-    minute = get_game_minute(game)
-    if minute is not None and 46 <= minute <= 60:
-        return True
     return has_status_text(game, "2nd half", "second half", "2h")
 
 
@@ -832,7 +887,11 @@ def get_competitor_label(game, competitor_id):
 def get_stage_score(game, short_name):
     for stage in game.get("stages", []):
         if stage.get("shortName") == short_name:
-            return stage.get("homeCompetitorScore"), stage.get("awayCompetitorScore")
+            home_score = stage.get("homeCompetitorScore")
+            away_score = stage.get("awayCompetitorScore")
+            if home_score is None or away_score is None:
+                return None, None
+            return fmt_score(home_score), fmt_score(away_score)
     return None, None
 
 
@@ -996,7 +1055,7 @@ def format_match_state_notification(game, state):
     if state == "started":
         return f"🟢 **Kickoff!** {get_match_scoreline(game)}"
     if state == "half_time":
-        return f"🟡 **Half time** {get_match_scoreline(game)}"
+        return f"🟡 **First half finished** {get_match_scoreline(game)}"
     if state == "second_half":
         return f"▶️ **Second half started** {get_match_scoreline(game)}"
     if state == "full_time":
@@ -2120,9 +2179,15 @@ async def process_polled_game(channel, game):
         ):
             await send_match_state_once(channel, game, "started", live_state)
 
-        if is_half_time_status(game):
+        half_time_key = f"{game_key}:half_time"
+        second_half_key = f"{game_key}:second_half"
+        half_time_notified = half_time_key in live_state["notified_match_state_keys"]
+        second_half_notified = second_half_key in live_state["notified_match_state_keys"]
+        minute_after_break = minute is not None and minute >= 46
+
+        if is_half_time_status(game) and not second_half_notified:
             await send_match_state_once(channel, game, "half_time", live_state)
-        elif is_second_half_status(game):
+        elif is_second_half_status(game) or (half_time_notified and minute_after_break):
             await send_match_state_once(channel, game, "second_half", live_state)
 
         score_increased = (
@@ -2643,6 +2708,17 @@ async def on_ready():
         print("✅ Live polling active (30s)")
     else:
         print("✅ Live polling already active")
+    if get_keep_alive_url() and not keep_alive_ping.is_running():
+        keep_alive_ping.start()
+        print(f"✅ Keep-alive ping active ({KEEP_ALIVE_SECONDS}s)")
 
 
-bot.run(DISCORD_TOKEN)
+def main():
+    if not DISCORD_TOKEN:
+        raise RuntimeError("DISCORD_TOKEN is missing. Add it to .env before starting the bot.")
+    start_health_server()
+    bot.run(DISCORD_TOKEN)
+
+
+if __name__ == "__main__":
+    main()
